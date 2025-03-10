@@ -59,6 +59,6 @@ if __name__ == '__main__':
         assert func(fp8_tensor, fp8_tensor, fp32_tensor, bf16_tensor, True, torch.cuda.current_stream()) == 0
     output = capture.capture()
     ref_output = f'{fp8_tensor.data_ptr()}\n{fp8_tensor.data_ptr()}\n{fp32_tensor.data_ptr()}\n{bf16_tensor.data_ptr()}\n1\n{torch.cuda.current_stream().cuda_stream}\n'
-    assert output == ref_output, f'{output=}, {ref_output=}'
+    assert output == ref_output, f'{output}, {ref_output}'
 
     print('JIT test passed')

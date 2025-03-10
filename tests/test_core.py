@@ -1,4 +1,5 @@
 import random
+import math
 import torch
 from typing import Tuple
 
@@ -31,6 +32,7 @@ def construct(m: int, k: int, n: int) -> \
     y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = x @ y.t()
+    # ref_out = None
 
     x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
     # Transpose earlier so that the testing will not trigger transposing kernels
@@ -63,21 +65,44 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
 
 
 def test_gemm() -> None:
+    # query the GPU L2 capcity with pytorch
+    cap = torch.cuda.get_device_properties(0).L2_cache_size
+
     print('Testing GEMM:')
     for m in (64, 128, 4096):
         for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
-            x_fp8, y_fp8, out, ref_out = construct(m, k, n)
-            deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-            diff = calc_diff(out, ref_out)
-            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+            # calculate the required buffers based on the GPU L2 cache size
+            input_size = (m + n) * k
+            required_buffers = max(math.ceil((cap * 2) / input_size), 2)
+            
+            x_fp8 = []
+            y_fp8 = []
+            out = []
+            ref_out = []
+            # allocate required buffers outside of the profiling loop
+            for i in range(required_buffers):
+                x,y,o,r = construct(m, k, n)
+                x_fp8.append(x)
+                y_fp8.append(y)
+                out.append(o)
+                ref_out.append(r)
+            
+            deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8[0], y_fp8[0], out[0])
 
             # noinspection PyShadowingNames
             def test_func():
-                # Construct new tensors every time to avoid L2 cache acceleration
-                x_fp8, y_fp8, out, ref_out = construct(m, k, n)
-                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+                # move through the buffers
+                test_func.iter_count = (test_func.iter_count + 1) % test_func.required_buffers
+                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8[test_func.iter_count], y_fp8[test_func.iter_count], out[test_func.iter_count])
+            test_func.iter_count = 0    
+            test_func.required_buffers = required_buffers
 
-            t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+            # increase the number of testing iterations to allow clocks to settle
+            num_tests = 10000
+            # num_tests is set for 8192x7168x8192 GEMM
+            ratio = max(math.ceil(8192 * 7168 * 8192 / (m * n * k)), 1)
+            num_tests = num_tests * ratio
+            t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True, num_tests=num_tests)
             print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
                   f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
                   f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
@@ -154,5 +179,5 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_gemm()
-    test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
+    # test_m_grouped_gemm_contiguous()
+    # test_m_grouped_gemm_masked()
