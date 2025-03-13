@@ -97,7 +97,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
                     rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
                     lhs @ rhs
                     dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
-                for _ in range(num_tests):
+                for _ in range(num_tests if i == 0 else num_tests // 10):
                     if flush_l2:
                         torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda').zero_()
                     fn()

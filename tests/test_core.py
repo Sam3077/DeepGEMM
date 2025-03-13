@@ -10,6 +10,10 @@ from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_align
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0
     m, n = x.shape
+    # override scale factor with uniform random [0, 1]
+    scale_factor = torch.rand((m, (n + 127) // 128), device='cuda', dtype=torch.float32, generator=torch.Generator(device='cuda').manual_seed(1234))
+    return (x.to(torch.float8_e4m3fn), scale_factor)
+
     x_view = x.view(m, -1, 128)
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
     return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / 448.0).view(m, -1)
@@ -18,6 +22,10 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
+    # override scale factor with uniform random [0, 1]
+    scale_factor = torch.rand((ceil_div(m, 128), ceil_div(n, 128)), device='cuda', dtype=torch.float32, generator=torch.Generator(device='cuda').manual_seed(1234))
+    return (x.to(torch.float8_e4m3fn), scale_factor)
+
     x_padded = torch.zeros((ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device)
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
@@ -28,8 +36,10 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 def construct(m: int, k: int, n: int) -> \
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
-    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+    # Identical tensor initialization as G2B
+    # G2B uses curand to generate an fp32 number as uniform random [1, 1], then converts it to the appropriate precision
+    x = torch.rand((m, k), device='cuda', dtype=torch.float32, generator=torch.Generator(device='cuda').manual_seed(1234)) * 2 - 1
+    y = torch.rand((n, k), device='cuda', dtype=torch.float32, generator=torch.Generator(device='cuda').manual_seed(1234)) * 2 - 1
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = x @ y.t()
     # ref_out = None
@@ -99,9 +109,9 @@ def test_gemm() -> None:
 
             # increase the number of testing iterations to allow clocks to settle
             num_tests = 10000
-            # num_tests is set for 8192x7168x8192 GEMM
-            ratio = max(math.ceil(8192 * 7168 * 8192 / (m * n * k)), 1)
-            num_tests = num_tests * ratio
+            if m <= 128:
+                num_tests = 100000
+            # print(f'num_tests: {num_tests}')
             t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True, num_tests=num_tests)
             print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
                   f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
