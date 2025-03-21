@@ -42,6 +42,8 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
     smem_a_per_stage = block_m * block_k
     smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
+    # scale B loads 1 element per stage
+    # smem_scales_b_per_stage = 4
     smem_scales_b = ceil_div(k, block_k) * 4
     smem_barrier = num_stages * 8 * 2
 
@@ -50,7 +52,11 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
     smem_size += num_stages * smem_a_per_stage
     smem_size += num_stages * smem_scales_a_per_stage
     smem_size += num_stages * smem_b_per_stage
+    # smem_size += num_stages * smem_scales_b_per_stage
     smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
+    # smem_size = ceil_div(smem_size, 8) * 8
+
+    # barrier
     smem_size += smem_barrier
     return smem_size
 
@@ -159,6 +165,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     global includes, template
     num_sms = get_num_sms()
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
+    # print(f"num SMS: {num_sms}, block_m: {block_m}, block_n: {block_n}, num_stages: {num_stages}, num_tma_multicast: {num_tma_multicast}, smem_size: {smem_size}")
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',

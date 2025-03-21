@@ -2,6 +2,7 @@ import random
 import math
 import torch
 from typing import Tuple
+from time import sleep
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
@@ -11,7 +12,7 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0
     m, n = x.shape
     # override scale factor with uniform random [0, 1]
-    scale_factor = torch.rand((m, (n + 127) // 128), device='cuda', dtype=torch.float32, generator=torch.Generator(device='cuda').manual_seed(1234))
+    scale_factor = torch.zeros((m, ceil_div(n, 128)), device='cuda', dtype=torch.float32) # generator=torch.Generator(device='cuda').manual_seed(1234))
     return (x.to(torch.float8_e4m3fn), scale_factor)
 
     x_view = x.view(m, -1, 128)
@@ -23,7 +24,7 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
     # override scale factor with uniform random [0, 1]
-    scale_factor = torch.rand((ceil_div(m, 128), ceil_div(n, 128)), device='cuda', dtype=torch.float32, generator=torch.Generator(device='cuda').manual_seed(1234))
+    scale_factor = torch.zeros((ceil_div(m, 128), ceil_div(n, 128)), device='cuda', dtype=torch.float32) # generator=torch.Generator(device='cuda').manual_seed(1234))
     return (x.to(torch.float8_e4m3fn), scale_factor)
 
     x_padded = torch.zeros((ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device)
@@ -38,8 +39,8 @@ def construct(m: int, k: int, n: int) -> \
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
     # Identical tensor initialization as G2B
     # G2B uses curand to generate an fp32 number as uniform random [1, 1], then converts it to the appropriate precision
-    x = torch.rand((m, k), device='cuda', dtype=torch.float32, generator=torch.Generator(device='cuda').manual_seed(1234)) * 2 - 1
-    y = torch.rand((n, k), device='cuda', dtype=torch.float32, generator=torch.Generator(device='cuda').manual_seed(1234)) * 2 - 1
+    x = torch.zeros((m, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.zeros((n, k), device='cuda', dtype=torch.bfloat16)
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = x @ y.t()
     # ref_out = None
@@ -52,8 +53,8 @@ def construct(m: int, k: int, n: int) -> \
 
 def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) -> \
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
-    x = torch.randn((num_groups, m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    x = torch.zeros((num_groups, m, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.zeros((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
     out = torch.empty((num_groups, m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = torch.einsum('gmk,gnk->gmn', x, y)
 
@@ -73,6 +74,50 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, out, ref_out
 
+def test_single_gemm(m: int, n: int, k: int, warmups: int = 5, iters: int = 5) -> None:
+    # query the GPU L2 capcity with pytorch
+    cap = torch.cuda.get_device_properties(0).L2_cache_size
+
+    print('Testing GEMM:')
+    # calculate the required buffers based on the GPU L2 cache size
+    input_size = (m + n) * k
+    required_buffers = max(math.ceil((cap * 2) / input_size), 2)
+    
+    x_fp8 = []
+    y_fp8 = []
+    out = []
+    ref_out = []
+    # allocate required buffers outside of the profiling loop
+    for i in range(required_buffers):
+        x,y,o,r = construct(m, k, n)
+        x_fp8.append(x)
+        y_fp8.append(y)
+        out.append(o)
+        ref_out.append(r)
+    
+    deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8[0], y_fp8[0], out[0])
+
+    # noinspection PyShadowingNames
+    def test_func():
+        # move through the buffers
+        test_func.iter_count = (test_func.iter_count + 1) % test_func.required_buffers
+        deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8[test_func.iter_count], y_fp8[test_func.iter_count], out[test_func.iter_count])
+    test_func.iter_count = 0    
+    test_func.required_buffers = required_buffers
+
+    # increase the number of testing iterations to allow clocks to settle
+    for _ in range(warmups):
+        test_func()
+    with torch.cuda.device(0):
+        torch.cuda.profiler.cudart().cudaProfilerStart()
+    for _ in range(iters):
+        test_func()
+    with torch.cuda.device(0):
+        torch.cuda.profiler.cudart().cudaProfilerStop()
+    # if m <= 128:
+    #     num_tests = 100
+    # print(f'num_tests: {num_tests}')
+    print()
 
 def test_gemm() -> None:
     # query the GPU L2 capcity with pytorch
@@ -108,14 +153,22 @@ def test_gemm() -> None:
             test_func.required_buffers = required_buffers
 
             # increase the number of testing iterations to allow clocks to settle
-            num_tests = 10000
-            if m <= 128:
-                num_tests = 100000
+            # for _ in range(warmups):
+            #     test_func()
+            # with torch.cuda.device(0):
+            #     torch.cuda.profiler.cudart().cudaProfilerStart()
+            # for _ in range(iters):
+            #     test_func()
+            # with torch.cuda.device(0):
+            #     torch.cuda.profiler.cudart().cudaProfilerStop()
+            # if m <= 128:
+            #     num_tests = 100
             # print(f'num_tests: {num_tests}')
+            num_tests = 100
             t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True, num_tests=num_tests)
             print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
-                  f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
-                  f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
+                    f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+                    f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     print()
 
 
@@ -123,7 +176,7 @@ def test_m_grouped_gemm_contiguous() -> None:
     print('Testing grouped contiguous GEMM:')
 
     for num_groups, m, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168), (8, 4096, 7168, 4096), (8, 4096, 2048, 7168)):
-        # TODO: make a stronger test
+        # TODO: make a stronger testbench_kineto
         x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=False)
         m_indices = torch.arange(0, num_groups, device='cuda', dtype=torch.int)
         m_indices = m_indices.unsqueeze(-1).expand(num_groups, m).contiguous().view(-1)
@@ -179,7 +232,16 @@ def test_m_grouped_gemm_masked() -> None:
     print()
 
 
+from argparse import ArgumentParser
 if __name__ == '__main__':
+    parser = ArgumentParser()
+    parser.add_argument("--M", type=int, default=-1)
+    parser.add_argument("--K", type=int, default=-1)
+    parser.add_argument("--N", type=int, default=-1)
+    parser.add_argument("--warmups", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=5)
+    args = parser.parse_args()
+    
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(0)
@@ -188,6 +250,9 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    test_gemm()
+    if args.M == -1 or args.N == -1 or args.K == -1:
+        test_gemm()
+    else:
+        test_single_gemm(args.M, args.N, args.K, args.warmups, args.iters)
     # test_m_grouped_gemm_contiguous()
     # test_m_grouped_gemm_masked()
