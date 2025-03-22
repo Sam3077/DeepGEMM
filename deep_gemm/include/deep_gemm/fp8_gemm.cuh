@@ -8,6 +8,7 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
+#include <cute/arch/copy_sm80.hpp>
 
 #include "mma_utils.cuh"
 #include "scheduler.cuh"
@@ -472,6 +473,7 @@ fp8_gemm_kernel_oneshot_scales_b(__nv_bfloat16* gmem_d, float* scales_b, int* gr
     if (threadIdx.x >= kNumMathThreads) {
         // TMA warp-group for loading data
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
+        cute::SM80_CP_ASYNC_CACHEALWAYS<float> copy_engine;
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             // one-shot get all scale B elements
@@ -487,12 +489,22 @@ fp8_gemm_kernel_oneshot_scales_b(__nv_bfloat16* gmem_d, float* scales_b, int* gr
             // Load B scales with DMA warp-groups
             // NOTES: except the first warp, we want to overlap loading B scales with ongoing TMA loads
             auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
-            auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
-            #pragma unroll
-            for (uint32_t i = threadIdx.x - kNumMathThreads; i < num_scales_b; i += kNumTMAThreads)
-                st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
-            // sync to ensure all data is available
+            float *local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
+
+            // if (threadIdx.x - kNumMathThreads > 32) {
+            for (uint32_t i = threadIdx.x - kNumMathThreads; i < num_scales_b; i += kNumTMAThreads) {
+                copy_engine.copy(local_scales_b[i], smem_scales_b[i]);
+            }
+            cute::cp_async_fence();
+            // }
             cutlass::arch::NamedBarrier(kNumTMAThreads, 1).sync();
+
+            // #pragma unroll
+            // for (uint32_t i = threadIdx.x - kNumMathThreads; i < num_scales_b; i += kNumTMAThreads) {
+            //     st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
+            // }
+            // sync to ensure all data is available
+            // cutlass::arch::NamedBarrier(kNumTMAThreads, 1).sync();
 
             if (threadIdx.x == kNumMathThreads) {
                 launch_k_iterations([&](int k_iter, auto type) {
@@ -520,7 +532,8 @@ fp8_gemm_kernel_oneshot_scales_b(__nv_bfloat16* gmem_d, float* scales_b, int* gr
                         tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                                     smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
 
-                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
+                        auto tx_count = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE;
+                        full_barrier.arrive_and_expect_tx(tx_count);
                     }
 
                     // Wait unaligned cases
@@ -557,7 +570,6 @@ fp8_gemm_kernel_oneshot_scales_b(__nv_bfloat16* gmem_d, float* scales_b, int* gr
                 num_full_iters = min(SHAPE_N - n_block_idx * BLOCK_N, BLOCK_N) / 8;
             }
             uint32_t num_scales_b = SHAPE_K_SCALES * (num_former_iters >= num_full_iters ? 1 : 2);
-
             // Accumulation for WGMMA or CUDA promotion
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
 
@@ -578,13 +590,18 @@ fp8_gemm_kernel_oneshot_scales_b(__nv_bfloat16* gmem_d, float* scales_b, int* gr
 
                 #pragma unroll
                 for (int s = 0; s < kNumInnerStages; ++ s) {
-                    // Wait TMA arrivals
-                    full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+                    if (k_iter == 0) {
+                        // await scale B arrival
+                        cute::cp_async_wait<0>();
+                    }
                     // Read B scales
                     float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1;
                     // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
                     if constexpr (not kMustUseUniformedScaleB)
                         scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+
+                    // Wait TMA arrivals
+                    full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
 
                     // Read A scales
                     // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
